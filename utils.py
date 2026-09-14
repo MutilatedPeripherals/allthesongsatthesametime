@@ -1,10 +1,13 @@
 import json
 import re
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
+
+_CACHE_LOCK = threading.Lock()
 
 def download_from_youtube_as_mp3(url: str) -> tuple[bool, Path | None]:
     if not re.match(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", url):
@@ -54,9 +57,15 @@ def download_from_youtube_as_mp3(url: str) -> tuple[bool, Path | None]:
             if downloaded_path.exists():
                 downloaded_path.rename(final_path)
 
-            cache[url] = str(final_path)
-            with open(cache_file, "w") as f:
-                json.dump(cache, f, indent=2)
+            with _CACHE_LOCK:
+                cache = {}
+                if cache_file.exists():
+                    try:
+                        cache = json.loads(cache_file.read_text())
+                    except (json.JSONDecodeError, OSError):
+                        cache = {}
+                cache[url] = str(final_path)
+                cache_file.write_text(json.dumps(cache, indent=2))
 
             return True, final_path
 

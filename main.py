@@ -1,9 +1,11 @@
+import html.parser
 import json
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
@@ -17,39 +19,66 @@ Given the band or album name, it builds one single audio file to use for the cha
 
 MB_BASE = "https://musicbrainz.org/ws/2/"
 MB_HEADERS = {"User-Agent": "allsongschallenge/0.1 (https://github.com/opencode/allsongschallenge)"}
+WIKI_BASE = "https://en.wikipedia.org/wiki/"
+WIKI_HEADERS = {"User-Agent": "allsongschallenge/0.1 (https://github.com/opencode/allsongschallenge)"}
+DOWNLOAD_CONCURRENCY = 3
+
+
+def format_elapsed(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+_LAST_MB_CALL = 0.0
 
 
 def _mb_get(url: str) -> dict:
+    global _LAST_MB_CALL
     req = urllib.request.Request(url, headers=MB_HEADERS)
     for attempt in range(3):
+        wait = 1.1 - (time.monotonic() - _LAST_MB_CALL)
+        if wait > 0:
+            time.sleep(wait)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
+                _LAST_MB_CALL = time.monotonic()
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            if e.code != 503 or attempt == 2:
+            if attempt == 2 or e.code != 503:
                 raise
         except urllib.error.URLError:
             if attempt == 2:
                 raise
-        time.sleep(2 * (attempt + 1))
+        time.sleep(2 + 2 * attempt)
     raise urllib.error.URLError("MusicBrainz request failed")
 
 
 def fetch_song_names(band_name: str, album_name: str | None = None) -> list[str]:
     if album_name:
+        songs = fetch_song_names_wikipedia(band_name, album_name)
+        if songs:
+            return songs
+        print(f"Wikipedia found no songs for {album_name}, falling back to MusicBrainz...")
+    try:
+        return _fetch_song_names(band_name, album_name)
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        print(f"MusicBrainz API error: {e}")
+        return []
+
+
+def _fetch_song_names(band_name: str, album_name: str | None = None) -> list[str]:
+    if album_name:
         query = urllib.parse.quote(f'release:"{album_name}" AND artist:"{band_name}"')
-        try:
-            releases = _mb_get(f"{MB_BASE}release/?query={query}&fmt=json&limit=5")["releases"]
-        except urllib.error.URLError:
-            return []
+        releases = _mb_get(f"{MB_BASE}release/?query={query}&fmt=json&limit=5")["releases"]
         if not releases:
             return []
         best_tracks: list[str] = []
         for release in releases:
-            try:
-                data = _mb_get(f"{MB_BASE}release/{release['id']}?inc=recordings&fmt=json")
-            except urllib.error.URLError:
-                continue
+            data = _mb_get(f"{MB_BASE}release/{release['id']}?inc=recordings&fmt=json")
             tracks = [
                 track["title"]
                 for medium in data.get("media", [])
@@ -61,33 +90,136 @@ def fetch_song_names(band_name: str, album_name: str | None = None) -> list[str]
         return best_tracks
 
     query = urllib.parse.quote(f"artist:{band_name}")
-    try:
-        data = _mb_get(f"{MB_BASE}artist/?query={query}&fmt=json&limit=1")
-        artists = data.get("artists", [])
-    except urllib.error.URLError:
-        return []
+    data = _mb_get(f"{MB_BASE}artist/?query={query}&fmt=json&limit=1")
+    artists = data.get("artists", [])
     if not artists:
         return []
 
     songs: set[str] = set()
-    try:
-        for offset in range(0, 500, 100):
-            batch = _mb_get(
-                f"{MB_BASE}release?artist={artists[0]['id']}&inc=recordings&limit=100&offset={offset}&fmt=json"
-            )
-            releases = batch.get("releases", [])
-            songs.update(
-                track["title"]
-                for release in releases
-                for medium in release.get("media", [])
-                for track in medium.get("tracks", [])
-                if track.get("title")
-            )
-            if len(releases) < 100:
-                break
-    except (urllib.error.URLError, urllib.error.HTTPError):
-        pass
+    for offset in range(0, 500, 100):
+        batch = _mb_get(
+            f"{MB_BASE}release?artist={artists[0]['id']}&inc=recordings&limit=100&offset={offset}&fmt=json"
+        )
+        releases = batch.get("releases", [])
+        songs.update(
+            track["title"]
+            for release in releases
+            for medium in release.get("media", [])
+            for track in medium.get("tracks", [])
+            if track.get("title")
+        )
+        if len(releases) < 100:
+            break
     return sorted(songs)
+
+
+class _TracklistParser(html.parser.HTMLParser):
+    TITLE_COLUMNS = {"title", "song", "track", "name", "track title"}
+    MISSABLE_WORDS = {
+        "title", "song", "track", "name", "no.", "length", "time",
+        "duration", "writer", "producer", "total length",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables: list[tuple[list[str], list[list[str]]]] = []
+        self._in_tracklist = 0
+        self._header: list[str] | None = None
+        self._rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+        self._row_is_header = False
+
+    def handle_starttag(self, tag, attrs):
+        cls = dict(attrs).get("class", "")
+        if tag == "table":
+            if "tracklist" in cls.split():
+                self._in_tracklist = 1
+                self._header = None
+                self._rows = []
+            elif self._in_tracklist:
+                self._in_tracklist += 1
+            return
+        if not self._in_tracklist:
+            return
+        if tag == "tr":
+            self._row_is_header = self._header is None
+            self._row = []
+        elif tag in ("th", "td") and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if not self._in_tracklist:
+            return
+        if tag in ("th", "td") and self._cell is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._row_is_header:
+                self._header = self._row
+            else:
+                self._rows.append(self._row)
+            self._row = None
+        elif tag == "table" and self._in_tracklist:
+            self._in_tracklist -= 1
+            if self._in_tracklist == 0 and self._header is not None:
+                self.tables.append((self._header, self._rows))
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def _parse_wikipedia_tracklist(page_html: str) -> list[str]:
+    parser = _TracklistParser()
+    parser.feed(page_html)
+    for header, rows in parser.tables:
+        title_idx = next(
+            (i for i, cell in enumerate(header) if cell.strip().lower() in _TracklistParser.TITLE_COLUMNS),
+            None,
+        )
+        if title_idx is None:
+            continue
+        tracks: list[str] = []
+        for cells in rows:
+            if len(cells) <= title_idx:
+                continue
+            title = cells[title_idx].strip().strip('"').strip()
+            title = re.sub(r"\s*\[\w+\]$", "", title)
+            if (
+                title
+                and title.lower() not in _TracklistParser.MISSABLE_WORDS
+                and not title.isdigit()
+                and not re.fullmatch(r"\d{1,3}:\d{2}", title)
+            ):
+                if title not in tracks:
+                    tracks.append(title)
+        if tracks:
+            return tracks
+    return []
+
+
+def fetch_song_names_wikipedia(band_name: str, album_name: str) -> list[str]:
+    candidates = (
+        f"{album_name} ({band_name} album)",
+        f"{album_name} ({band_name} Album)",
+        album_name,
+    )
+    for title in candidates:
+        url = WIKI_BASE + urllib.parse.quote(title.replace(" ", "_"))
+        try:
+            req = urllib.request.Request(url, headers=WIKI_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                page = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as e:
+            print(f"Wikipedia fetch failed for {title!r}: {e}")
+            continue
+        tracks = _parse_wikipedia_tracklist(page)
+        if tracks:
+            return tracks
+        print(f"No tracklist found on Wikipedia page {title!r}.")
+    print(f"No Wikipedia page found for {album_name} by {band_name}.")
+    return []
 
 
 def search_youtube_url(query: str) -> str | None:
@@ -142,29 +274,52 @@ def open_and_play(urls: list[str]) -> None:
             browser.close()
 
 
-def build_challenge(band_name: str, album_name: str | None = None) -> Path:
+def _confirm_songs(song_names: list[str], scope: str) -> bool:
+    print(f"\nFound {len(song_names)} songs for {scope}:")
+    for index, song in enumerate(song_names, 1):
+        print(f"  {index:>3}. {song}")
+    answer = input("\nDownload all of these? [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def _download_song(song: str, band_name: str) -> Path | None:
+    url = search_youtube_url(f"{song} {band_name}")
+    if not url:
+        print(f"No YouTube video found for {song}.")
+        return None
+    print(f"Downloading {song}...")
+    ok, path = download_from_youtube_as_mp3(url)
+    if ok and path:
+        return path
+    print(f"Failed to download {song}.")
+    return None
+
+
+def build_challenge(band_name: str, album_name: str | None = None, confirm: bool = True) -> Path:
+    t0 = time.perf_counter()
     scope = album_name or band_name
 
     song_names = fetch_song_names(band_name, album_name)
     if not song_names:
         print(f"No songs found for {scope}.")
         return Path()
+    print(f"Fetched {len(song_names)} songs in {format_elapsed(time.perf_counter() - t0)}.")
 
-    downloaded: list[Path] = []
-    for song in song_names:
-        url = search_youtube_url(f"{song} {scope}")
-        if not url:
-            print(f"No YouTube video found for {song}.")
-            continue
-        print(f"Downloading {song}...")
-        ok, path = download_from_youtube_as_mp3(url)
-        if ok and path:
-            downloaded.append(path)
-        else:
-            print(f"Failed to download {song}.")
+    if confirm and not _confirm_songs(song_names, scope):
+        print("Aborted.")
+        return Path()
+
+    t1 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_CONCURRENCY) as executor:
+        downloaded = [
+            path
+            for path in executor.map(lambda song: _download_song(song, band_name), song_names)
+            if path is not None
+        ]
     if not downloaded:
         print("No songs could be downloaded.")
         return Path()
+    print(f"Downloaded {len(downloaded)} songs in {format_elapsed(time.perf_counter() - t1)}.")
 
     output_folder = Path.cwd().resolve() / "challenges"
     output_folder.mkdir(exist_ok=True)
@@ -172,6 +327,7 @@ def build_challenge(band_name: str, album_name: str | None = None) -> Path:
 
     print(f"Mixing {len(downloaded)} songs into {output}...")
     if mix_mp3s(downloaded, output):
+        print(f"Challenge ready in {format_elapsed(time.perf_counter() - t0)} total.")
         return output
     return Path()
 
@@ -185,7 +341,7 @@ def build_challenge_naive(band_name: str, album_name: str | None = None) -> Path
         return Path()
     urls = []
     for song in song_names:
-        url = search_youtube_url(f"{song} {scope}")
+        url = search_youtube_url(f"{song} {band_name}")
         if url:
             urls.append(url)
 
@@ -208,10 +364,13 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--band", required=True, help="Band name")
     parser.add_argument("-a", "--album", default=None, help="Album name (requires band)")
     parser.add_argument("--naive", action="store_true", help="Use the naive browser-tabs approach")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip the song-list confirmation")
     args = parser.parse_args()
 
+    start = time.perf_counter()
     if args.naive:
         challenge_file = build_challenge_naive(args.band, args.album)
     else:
-        challenge_file = build_challenge(args.band, args.album)
+        challenge_file = build_challenge(args.band, args.album, confirm=not args.yes)
     print(f"Challenge file: {challenge_file}")
+    print(f"Total time: {format_elapsed(time.perf_counter() - start)}")
