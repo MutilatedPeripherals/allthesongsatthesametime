@@ -295,7 +295,9 @@ def _download_song(song: str, band_name: str) -> Path | None:
     return None
 
 
-def build_challenge(band_name: str, album_name: str | None = None, confirm: bool = True) -> Path:
+def build_challenge(
+    band_name: str, album_name: str | None = None, confirm: bool = True, output_dir: str = "challenges"
+) -> Path:
     t0 = time.perf_counter()
     scope = album_name or band_name
 
@@ -321,8 +323,8 @@ def build_challenge(band_name: str, album_name: str | None = None, confirm: bool
         return Path()
     print(f"Downloaded {len(downloaded)} songs in {format_elapsed(time.perf_counter() - t1)}.")
 
-    output_folder = Path.cwd().resolve() / "challenges"
-    output_folder.mkdir(exist_ok=True)
+    output_folder = Path(output_dir).resolve()
+    output_folder.mkdir(parents=True, exist_ok=True)
     output = output_folder / f"{re.sub(r'[<>:\"/\\\\|?*]', ' ', scope)}_challenge.mp3"
 
     print(f"Mixing {len(downloaded)} songs into {output}...")
@@ -332,7 +334,9 @@ def build_challenge(band_name: str, album_name: str | None = None, confirm: bool
     return Path()
 
 
-def build_challenge_naive(band_name: str, album_name: str | None = None) -> Path:
+def build_challenge_naive(
+    band_name: str, album_name: str | None = None, output_dir: str = "challenges"
+) -> Path:
     scope = album_name or band_name
 
     song_names = fetch_song_names(band_name, album_name)
@@ -349,7 +353,9 @@ def build_challenge_naive(band_name: str, album_name: str | None = None) -> Path
         print(f"Could not find any YouTube videos for {scope}.")
         return Path()
 
-    artifact = Path.cwd().resolve() / f"naive_{re.sub(r'[<>:\"/\\\\|?*]', ' ', scope)}.txt"
+    artifact_folder = Path(output_dir).resolve()
+    artifact_folder.mkdir(parents=True, exist_ok=True)
+    artifact = artifact_folder / f"naive_{re.sub(r'[<>:\"/\\\\|?*]', ' ', scope)}.txt"
     artifact.write_text("\n".join(urls) + "\n")
 
     print(f"Opening {len(urls)} YouTube tabs for {scope}...")
@@ -363,14 +369,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build an all-songs challenge.")
     parser.add_argument("-b", "--band", required=True, help="Band name")
     parser.add_argument("-a", "--album", default=None, help="Album name (requires band)")
+    parser.add_argument("-o", "--output", default="challenges", help="Output directory (created if missing)")
     parser.add_argument("--naive", action="store_true", help="Use the naive browser-tabs approach")
     parser.add_argument("-y", "--yes", action="store_true", help="Skip the song-list confirmation")
     args = parser.parse_args()
 
     start = time.perf_counter()
     if args.naive:
-        challenge_file = build_challenge_naive(args.band, args.album)
+        challenge_file = build_challenge_naive(args.band, args.album, output_dir=args.output)
     else:
-        challenge_file = build_challenge(args.band, args.album, confirm=not args.yes)
+        challenge_file = build_challenge(
+            args.band, args.album, confirm=not args.yes, output_dir=args.output
+        )
     print(f"Challenge file: {challenge_file}")
     print(f"Total time: {format_elapsed(time.perf_counter() - start)}")

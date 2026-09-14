@@ -109,6 +109,20 @@ class BuildChallengeTest(unittest.TestCase):
             result = main.build_challenge("Wormrot", "Dirge")
         self.assertEqual(result, Path())
 
+    def test_build_challenge_custom_output_dir(self):
+        songs = ["Song A"]
+        out_dir = Path("/tmp/opencode/asc_test_out")
+        with (
+            mock.patch.object(main, "fetch_song_names", return_value=songs),
+            mock.patch.object(main, "search_youtube_url", return_value="https://youtube.com/watch?v=1"),
+            mock.patch.object(main, "download_from_youtube_as_mp3", return_value=(True, Path("/tmp/fake/a.mp3"))),
+            mock.patch.object(main, "mix_mp3s", return_value=True),
+        ):
+            result = main.build_challenge("Wormrot", "Dirge", output_dir=str(out_dir))
+
+        self.assertEqual(result, out_dir.resolve() / "Dirge_challenge.mp3")
+        self.assertTrue(result.parent.is_dir())
+
 
 class FetchSongNamesTest(unittest.TestCase):
     def test_album_picks_fewest_track_release(self):
