@@ -1,2 +1,5 @@
 .venv
 .idea
+downloads/*
+challenges/*
+*.json
