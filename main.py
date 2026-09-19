@@ -234,46 +234,6 @@ def search_youtube_url(query: str) -> str | None:
     return None
 
 
-def _accept_cookies(page) -> None:
-    consent = page.locator(
-        'button:has-text("Accept all"), button:has-text("Accept the lot"), button:has-text("I agree")'
-    ).first
-    try:
-        consent.click(timeout=5_000)
-    except Exception:
-        pass
-
-
-def open_and_play(urls: list[str]) -> None:
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        try:
-            context = browser.new_context()
-            pages = []
-            for url in urls:
-                try:
-                    page = context.new_page()
-                    page.goto(url, timeout=120_000, wait_until="domcontentloaded")
-                    pages.append(page)
-                except Exception as e:
-                    print(f"Failed to open {url}: {e}")
-            for page in pages:
-                try:
-                    _accept_cookies(page)
-                    page.wait_for_selector(".ytp-large-play-button", timeout=15_000)
-                    page.click(".ytp-large-play-button")
-                except Exception:
-                    try:
-                        page.click(".ytp-play-button", timeout=5_000)
-                    except Exception:
-                        page.keyboard.press("k")
-            input("Press Enter to close the browser and stop playback...")
-        finally:
-            browser.close()
-
-
 def _confirm_songs(song_names: list[str], scope: str) -> bool:
     print(f"\nFound {len(song_names)} songs for {scope}:")
     for index, song in enumerate(song_names, 1):
@@ -334,35 +294,6 @@ def build_challenge(
     return Path()
 
 
-def build_challenge_naive(
-    band_name: str, album_name: str | None = None, output_dir: str = "challenges"
-) -> Path:
-    scope = album_name or band_name
-
-    song_names = fetch_song_names(band_name, album_name)
-    if not song_names:
-        print(f"No songs found for {scope}.")
-        return Path()
-    urls = []
-    for song in song_names:
-        url = search_youtube_url(f"{song} {band_name}")
-        if url:
-            urls.append(url)
-
-    if not urls:
-        print(f"Could not find any YouTube videos for {scope}.")
-        return Path()
-
-    artifact_folder = Path(output_dir).resolve()
-    artifact_folder.mkdir(parents=True, exist_ok=True)
-    artifact = artifact_folder / f"naive_{re.sub(r'[<>:\"/\\\\|?*]', ' ', scope)}.txt"
-    artifact.write_text("\n".join(urls) + "\n")
-
-    print(f"Opening {len(urls)} YouTube tabs for {scope}...")
-    open_and_play(urls)
-    return artifact
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -370,16 +301,10 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--band", required=True, help="Band name")
     parser.add_argument("-a", "--album", default=None, help="Album name (requires band)")
     parser.add_argument("-o", "--output", default="challenges", help="Output directory (created if missing)")
-    parser.add_argument("--naive", action="store_true", help="Use the naive browser-tabs approach")
     parser.add_argument("-y", "--yes", action="store_true", help="Skip the song-list confirmation")
     args = parser.parse_args()
 
     start = time.perf_counter()
-    if args.naive:
-        challenge_file = build_challenge_naive(args.band, args.album, output_dir=args.output)
-    else:
-        challenge_file = build_challenge(
-            args.band, args.album, confirm=not args.yes, output_dir=args.output
-        )
+    challenge_file = build_challenge(args.band, args.album, confirm=not args.yes, output_dir=args.output)
     print(f"Challenge file: {challenge_file}")
     print(f"Total time: {format_elapsed(time.perf_counter() - start)}")
