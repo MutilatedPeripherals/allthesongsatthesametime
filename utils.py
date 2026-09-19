@@ -14,16 +14,18 @@ def download_from_youtube_as_mp3(url: str) -> tuple[bool, Path | None]:
         raise ValueError("The provided URL is not a valid YouTube video URL.")
 
     cache_file = Path.cwd().resolve() / "download_cache.json"
+    cache = {}
     if cache_file.exists():
-        with open(cache_file, "r") as f:
-            cache = json.load(f)
+        try:
+            with open(cache_file, "r") as f:
+                cache = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cache = {}
         if url in cache:
             cached_path = Path(cache[url])
             if cached_path.exists():
                 print("Using cached download.")
                 return True, cached_path
-    else:
-        cache = {}
 
     output_folder = Path.cwd().resolve() / "downloads"
     output_folder.mkdir(exist_ok=True)
@@ -116,3 +118,14 @@ def mix_mp3s(input_paths: list[Path], output_path: Path) -> bool:
         print(f"Failed to mix audio: {result.stderr[-2000:]}")
         return False
     return output_path.exists()
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) != 2:
+        print("Usage: python utils.py <youtube-url>")
+        sys.exit(1)
+
+    result = download_from_youtube_as_mp3(sys.argv[1])
+    print(result)
